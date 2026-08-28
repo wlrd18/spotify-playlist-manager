@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import inngest.fast_api
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
@@ -13,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 
 from .analysis import analyze, detect_outliers, normalize
 from .db import connect, init_db, row_dict
+from .inngest_jobs import configured as inngest_configured
+from .inngest_jobs import inngest_client, queue_sync, sync_spotify_playlists
 from .spotify import API, access_token, authorization_url, exchange_code, spotify_get
 
 load_dotenv()
@@ -28,6 +31,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Playlist intelligence", lifespan=lifespan)
 app.mount("/assets", StaticFiles(directory=FRONTEND), name="assets")
+inngest.fast_api.serve(app, inngest_client, [sync_spotify_playlists])
 
 
 def status(job_id, status, stage, message="", **counts):
@@ -77,7 +81,69 @@ async def refresh_artist_genres(client: httpx.AsyncClient, token: str) -> None:
             db.commit()
 
 
-async def run_sync(job_id: str):
+async def prepare_sync(job_id: str) -> dict:
+    token = await access_token()
+    with connect() as db:
+        account = db.execute("SELECT spotify_user_id FROM oauth_token WHERE id=1").fetchone()
+    owner_id = account["spotify_user_id"]
+    status(job_id, "running", "listing playlists")
+    async with httpx.AsyncClient(timeout=25) as client:
+        playlists, url, params = [], f"{API}/me/playlists", {"limit": 50}
+        while url:
+            response = await spotify_get(client, url, token, params)
+            response.raise_for_status(); payload = response.json(); playlists.extend(payload.get("items", [])); url = payload.get("next"); params = None
+    playlists = [playlist for playlist in playlists if (playlist.get("owner") or {}).get("id") == owner_id]
+    with connect() as db:
+        db.execute("DELETE FROM playlist WHERE owner_id IS NOT NULL AND owner_id != ?", (owner_id,))
+        for playlist in playlists:
+            db.execute("INSERT INTO playlist(spotify_id,name,owner_id,snapshot_id,track_total,readable,error_reason,spotify_url) VALUES(?,?,?,?,?,1,NULL,?) ON CONFLICT(spotify_id) DO UPDATE SET name=excluded.name, owner_id=excluded.owner_id, snapshot_id=excluded.snapshot_id, track_total=excluded.track_total, readable=1, error_reason=NULL, spotify_url=excluded.spotify_url, updated_at=CURRENT_TIMESTAMP", (playlist["id"], playlist.get("name", "Untitled"), owner_id, playlist.get("snapshot_id"), (playlist.get("items") or playlist.get("tracks") or {}).get("total", 0), (playlist.get("external_urls") or {}).get("spotify")))
+    status(job_id, "running", "importing items", listed=len(playlists))
+    return {"owner_id": owner_id, "playlist_ids": [playlist["id"] for playlist in playlists]}
+
+
+async def import_playlist_batch(job_id: str, spotify_ids: list[str]) -> list[dict]:
+    token = await access_token()
+
+    async def import_one(spotify_id: str) -> dict:
+        with connect() as db:
+            row = db.execute("SELECT id FROM playlist WHERE spotify_id=?", (spotify_id,)).fetchone()
+            db.execute("DELETE FROM playlist_item WHERE playlist_id=?", (row["id"],))
+        url, params, position, items = f"{API}/playlists/{spotify_id}/items", {"limit": 50}, 0, 0
+        try:
+            async with httpx.AsyncClient(timeout=25) as client:
+                while url:
+                    response = await spotify_get(client, url, token, params)
+                    if response.status_code == 403:
+                        with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", ("Spotify denied access to this playlist's items", row["id"]))
+                        return {"readable": 0, "skipped": 1, "items": items}
+                    response.raise_for_status(); payload = response.json()
+                    with connect() as db:
+                        for item in payload.get("items", []):
+                            track_id, item_type = upsert_track(db, item)
+                            db.execute("INSERT INTO playlist_item(playlist_id,position,track_id,item_type,added_at) VALUES(?,?,?,?,?)", (row["id"], position, track_id, item_type, item.get("added_at"))); position += 1; items += 1
+                    url, params = payload.get("next"), None
+            return {"readable": 1, "skipped": 0, "items": items}
+        except httpx.HTTPError as error:
+            with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", (str(error)[:200], row["id"]))
+            return {"readable": 0, "skipped": 1, "items": items}
+
+    results = await asyncio.gather(*(import_one(spotify_id) for spotify_id in spotify_ids))
+    status(job_id, "running", "importing items")
+    return results
+
+
+async def finalize_sync(job_id: str, owner_id: str, results: list[dict]) -> dict:
+    readable = sum(result["readable"] for result in results)
+    skipped = sum(result["skipped"] for result in results)
+    items = sum(result["items"] for result in results)
+    status(job_id, "running", "analyzing", readable=readable, skipped=skipped, items=items)
+    with connect() as db: analyze(db, owner_id, int(os.getenv("MIN_TRACKS_FOR_SCORE", "8")))
+    final = "completed_with_warnings" if skipped else "completed"
+    status(job_id, final, "complete", "Analysis is ready", readable=readable, skipped=skipped, items=items)
+    return {"status": final}
+
+
+async def run_sync(job_id: str, raise_on_error: bool = False):
     try:
         token = await access_token()
         with connect() as db:
@@ -131,6 +197,8 @@ async def run_sync(job_id: str):
         status(job_id, final, "complete", "Analysis is ready", readable=readable, skipped=skipped, items=item_count)
     except Exception as error:
         status(job_id, "failed", "failed", str(error)[:300])
+        if raise_on_error:
+            raise
 
 
 @app.get("/")
@@ -165,7 +233,21 @@ async def sync():
         existing = db.execute("SELECT id FROM sync_run WHERE status='running'").fetchone()
         if existing: return {"job_id": existing["id"]}
         job_id = str(uuid.uuid4()); db.execute("INSERT INTO sync_run(id,status,stage,message) VALUES(?,?,?,?)", (job_id, "running", "queued", "Sync queued")); db.commit()
-    asyncio.create_task(run_sync(job_id)); return {"job_id": job_id}
+    if inngest_configured():
+        try:
+            await queue_sync(job_id)
+        except Exception:
+            status(job_id, "failed", "failed", "Could not queue the Spotify sync")
+            raise HTTPException(503, "Could not queue the Spotify sync")
+        return {"job_id": job_id, "runner": "inngest"}
+
+    if os.getenv("VERCEL"):
+        status(job_id, "failed", "failed", "Inngest is not configured")
+        raise HTTPException(503, "Sync is not configured yet")
+
+    # Local development can still run without an Inngest account.
+    asyncio.create_task(run_sync(job_id))
+    return {"job_id": job_id, "runner": "local"}
 
 @app.get("/api/sync/{job_id}")
 def sync_status(job_id: str):
