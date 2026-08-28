@@ -1,3 +1,4 @@
+HEAD
 # Playlist intelligence
 
 Local, read-only Spotify playlist analysis. It finds playlist overlap and a genre breakdown based on primary-artist tags. It does not change Spotify playlists.
