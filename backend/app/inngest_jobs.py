@@ -8,6 +8,9 @@ import inngest
 
 inngest_client = inngest.Inngest(
     app_id="spotify-playlist-intelligence",
+    # The Vercel integration can expose the Git branch name as INNGEST_ENV.
+    # This single-user app uses Inngest's visible Production environment instead.
+    env="production",
     # Local development has no Inngest keys. Production enables signature checks
     # when the event key is present in Vercel's protected environment variables.
     is_production=bool(os.getenv("INNGEST_EVENT_KEY")),
