@@ -38,17 +38,24 @@ async def sync_spotify_playlists(ctx: inngest.Context) -> dict[str, str]:
         raise ValueError("Invalid sync job")
 
     # Import here to avoid a circular import while FastAPI registers this function.
-    from .main import finalize_sync, import_playlist_batch, prepare_sync
+    from .main import finalize_sync, import_playlist_page, prepare_sync
 
     prepared = await ctx.step.run("prepare-sync", partial(prepare_sync, job_id))
     results = []
-    playlist_ids = prepared["playlist_ids"]
-    for start in range(0, len(playlist_ids), 3):
-        batch = playlist_ids[start:start + 3]
-        batch_results = await ctx.step.run(
-            f"import-playlists-{start // 3 + 1}",
-            partial(import_playlist_batch, job_id, batch),
-        )
-        results.extend(batch_results)
+    for playlist_number, spotify_id in enumerate(prepared["playlist_ids"], start=1):
+        offset = 0
+        imported = 0
+        page_number = 1
+        while True:
+            page = await ctx.step.run(
+                f"playlist-{playlist_number}-page-{page_number}",
+                partial(import_playlist_page, job_id, spotify_id, offset),
+            )
+            imported += page["items"]
+            if page["done"]:
+                results.append({"readable": page["readable"], "skipped": page["skipped"], "items": imported})
+                break
+            offset = page["next_offset"]
+            page_number += 1
     await ctx.step.run("analyze-playlists", partial(finalize_sync, job_id, prepared["owner_id"], results))
     return {"job_id": job_id, "status": "completed"}

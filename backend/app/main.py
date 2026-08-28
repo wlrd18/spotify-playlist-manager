@@ -110,40 +110,43 @@ async def prepare_sync(job_id: str) -> dict:
     return {"owner_id": owner_id, "playlist_ids": [playlist["id"] for playlist in playlists]}
 
 
-async def import_playlist_batch(job_id: str, spotify_ids: list[str]) -> list[dict]:
+async def import_playlist_page(job_id: str, spotify_id: str, offset: int) -> dict:
+    """Import one Spotify page so Inngest can retry long playlists safely."""
     token = await access_token()
 
-    async def import_one(spotify_id: str) -> dict:
-        with connect() as db:
-            row = db.execute("SELECT id FROM playlist WHERE spotify_id=?", (spotify_id,)).fetchone()
+    with connect() as db:
+        row = db.execute("SELECT id FROM playlist WHERE spotify_id=?", (spotify_id,)).fetchone()
+        if not row:
+            raise ValueError("Playlist is missing from the current sync")
+        if offset == 0:
             db.execute("DELETE FROM playlist_item WHERE playlist_id=?", (row["id"],))
-        url, params, position, items = f"{API}/playlists/{spotify_id}/items", {"limit": 50}, 0, 0
-        try:
-            async with httpx.AsyncClient(timeout=25) as client:
-                while url:
-                    response = await spotify_get(client, url, token, params)
-                    if response.status_code == 403:
-                        with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", ("Spotify denied access to this playlist's items", row["id"]))
-                        return {"readable": 0, "skipped": 1, "items": items}
-                    response.raise_for_status(); payload = response.json()
-                    with connect() as db:
-                        for item in payload.get("items", []):
-                            track_id, item_type = upsert_track(db, item)
-                            db.execute("INSERT INTO playlist_item(playlist_id,position,track_id,item_type,added_at) VALUES(?,?,?,?,?)", (row["id"], position, track_id, item_type, item.get("added_at"))); position += 1; items += 1
-                    # Update after every Spotify page so a large playlist does
-                    # not look frozen while its tracks are being saved.
-                    advance_sync_progress(job_id, items=len(payload.get("items", [])))
-                    url, params = payload.get("next"), None
-            advance_sync_progress(job_id, readable=1)
-            return {"readable": 1, "skipped": 0, "items": items}
-        except httpx.HTTPError as error:
-            with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", (str(error)[:200], row["id"]))
-            advance_sync_progress(job_id, skipped=1)
-            return {"readable": 0, "skipped": 1, "items": items}
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await spotify_get(client, f"{API}/playlists/{spotify_id}/items", token, {"limit": 50, "offset": offset})
+            if response.status_code == 403:
+                with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", ("Spotify denied access to this playlist's items", row["id"]))
+                advance_sync_progress(job_id, skipped=1)
+                return {"done": True, "readable": 0, "skipped": 1, "items": 0}
+            response.raise_for_status(); payload = response.json()
+    except httpx.HTTPError as error:
+        with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", (str(error)[:200], row["id"]))
+        advance_sync_progress(job_id, skipped=1)
+        return {"done": True, "readable": 0, "skipped": 1, "items": 0}
 
-    results = await asyncio.gather(*(import_one(spotify_id) for spotify_id in spotify_ids))
-    status(job_id, "running", "importing items")
-    return results
+    inserted = 0
+    with connect() as db:
+        for position, item in enumerate(payload.get("items", []), start=offset):
+            track_id, item_type = upsert_track(db, item)
+            result = db.execute("INSERT INTO playlist_item(playlist_id,position,track_id,item_type,added_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING RETURNING position", (row["id"], position, track_id, item_type, item.get("added_at"))).fetchone()
+            inserted += int(result is not None)
+    # Page-level progress stays visible even when a playlist contains thousands
+    # of songs. Duplicate step retries do not inflate the counter.
+    advance_sync_progress(job_id, items=inserted)
+    next_offset = offset + len(payload.get("items", []))
+    done = not payload.get("next")
+    if done:
+        advance_sync_progress(job_id, readable=1)
+    return {"done": done, "next_offset": next_offset, "readable": int(done), "skipped": 0, "items": inserted}
 
 
 async def finalize_sync(job_id: str, owner_id: str, results: list[dict]) -> dict:
