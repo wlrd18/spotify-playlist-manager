@@ -36,7 +36,7 @@ inngest.fast_api.serve(app, inngest_client, [sync_spotify_playlists])
 
 def status(job_id, status, stage, message="", **counts):
     with connect() as db:
-        db.execute("UPDATE sync_run SET status=?, stage=?, message=?, listed_playlists=COALESCE(?,listed_playlists), readable_playlists=COALESCE(?,readable_playlists), imported_items=COALESCE(?,imported_items), skipped_playlists=COALESCE(?,skipped_playlists), completed_at=CASE WHEN ? IN ('completed','completed_with_warnings','failed') THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?", (status, stage, message, counts.get("listed"), counts.get("readable"), counts.get("items"), counts.get("skipped"), status, job_id))
+        db.execute("UPDATE sync_run SET status=?, stage=?, message=?, listed_playlists=COALESCE(?,listed_playlists), readable_playlists=COALESCE(?,readable_playlists), imported_items=COALESCE(?,imported_items), skipped_playlists=COALESCE(?,skipped_playlists), last_progress_at=CASE WHEN ?='running' THEN CURRENT_TIMESTAMP ELSE last_progress_at END, completed_at=CASE WHEN ? IN ('completed','completed_with_warnings','failed') THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?", (status, stage, message, counts.get("listed"), counts.get("readable"), counts.get("items"), counts.get("skipped"), status, status, job_id))
         db.commit()
 
 
@@ -44,7 +44,7 @@ def advance_sync_progress(job_id: str, *, items: int = 0, readable: int = 0, ski
     """Atomically record visible progress while parallel playlist imports run."""
     with connect() as db:
         db.execute(
-            "UPDATE sync_run SET imported_items=imported_items + ?, readable_playlists=readable_playlists + ?, skipped_playlists=skipped_playlists + ? WHERE id=?",
+            "UPDATE sync_run SET imported_items=imported_items + ?, readable_playlists=readable_playlists + ?, skipped_playlists=skipped_playlists + ?, last_progress_at=CURRENT_TIMESTAMP WHERE id=?",
             (items, readable, skipped, job_id),
         )
 
@@ -111,7 +111,7 @@ async def prepare_sync(job_id: str) -> dict:
 
 
 async def import_playlist_page(job_id: str, spotify_id: str, offset: int) -> dict:
-    """Import one Spotify page so Inngest can retry long playlists safely."""
+    """Import ten songs per durable step to stay below Vercel's timeout."""
     token = await access_token()
 
     with connect() as db:
@@ -122,7 +122,7 @@ async def import_playlist_page(job_id: str, spotify_id: str, offset: int) -> dic
             db.execute("DELETE FROM playlist_item WHERE playlist_id=?", (row["id"],))
     try:
         async with httpx.AsyncClient(timeout=25) as client:
-            response = await spotify_get(client, f"{API}/playlists/{spotify_id}/items", token, {"limit": 50, "offset": offset})
+            response = await spotify_get(client, f"{API}/playlists/{spotify_id}/items", token, {"limit": 10, "offset": offset})
             if response.status_code == 403:
                 with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", ("Spotify denied access to this playlist's items", row["id"]))
                 advance_sync_progress(job_id, skipped=1)
@@ -247,10 +247,9 @@ def disconnect():
 async def sync():
     with connect() as db:
         if not db.execute("SELECT 1 FROM oauth_token WHERE id=1").fetchone(): raise HTTPException(400, "Connect Spotify first")
-        # A job that loses its worker would otherwise block every later sync
-        # forever. Five minutes catches work that never starts; two hours is
-        # safely beyond a normal batched import while clearing abandoned runs.
-        db.execute("UPDATE sync_run SET status='failed', stage='failed', message='Sync timed out. Please retry.', completed_at=CURRENT_TIMESTAMP WHERE status='running' AND started_at < CURRENT_TIMESTAMP - INTERVAL '2 hours'")
+        # A job that stops reporting progress has lost its worker. Each Spotify
+        # page refreshes this heartbeat, so real imports are never replaced.
+        db.execute("UPDATE sync_run SET status='failed', stage='failed', message='Sync stopped reporting progress. Please retry.', completed_at=CURRENT_TIMESTAMP WHERE status='running' AND COALESCE(last_progress_at,started_at) < CURRENT_TIMESTAMP - INTERVAL '10 minutes'")
         existing = db.execute("SELECT id FROM sync_run WHERE status='running'").fetchone()
         if existing: return {"job_id": existing["id"]}
         job_id = str(uuid.uuid4()); db.execute("INSERT INTO sync_run(id,status,stage,message) VALUES(?,?,?,?)", (job_id, "running", "queued", "Sync queued")); db.commit()

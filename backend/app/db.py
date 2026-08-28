@@ -30,7 +30,7 @@ def init_db() -> None:
         db.execute("""
         CREATE TABLE IF NOT EXISTS oauth_pending (state TEXT PRIMARY KEY, verifier TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS oauth_token (id INTEGER PRIMARY KEY CHECK (id=1), access_token TEXT NOT NULL, refresh_token TEXT, expires_at BIGINT NOT NULL, spotify_user_id TEXT);
-        CREATE TABLE IF NOT EXISTS sync_run (id TEXT PRIMARY KEY, status TEXT NOT NULL, stage TEXT NOT NULL, message TEXT, listed_playlists INTEGER DEFAULT 0, readable_playlists INTEGER DEFAULT 0, imported_items INTEGER DEFAULT 0, skipped_playlists INTEGER DEFAULT 0, started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TIMESTAMPTZ);
+        CREATE TABLE IF NOT EXISTS sync_run (id TEXT PRIMARY KEY, status TEXT NOT NULL, stage TEXT NOT NULL, message TEXT, listed_playlists INTEGER DEFAULT 0, readable_playlists INTEGER DEFAULT 0, imported_items INTEGER DEFAULT 0, skipped_playlists INTEGER DEFAULT 0, started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, last_progress_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TIMESTAMPTZ);
         CREATE TABLE IF NOT EXISTS playlist (id BIGSERIAL PRIMARY KEY, spotify_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, owner_id TEXT, snapshot_id TEXT, track_total INTEGER DEFAULT 0, readable INTEGER DEFAULT 1, error_reason TEXT, spotify_url TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS track (id BIGSERIAL PRIMARY KEY, spotify_id TEXT UNIQUE, isrc TEXT, name TEXT NOT NULL, normalized_name TEXT NOT NULL, duration_ms INTEGER, album_name TEXT, release_date TEXT, release_year INTEGER, linked_from_id TEXT, is_local INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS artist (id BIGSERIAL PRIMARY KEY, spotify_id TEXT UNIQUE, name TEXT NOT NULL, normalized_name TEXT NOT NULL, genres_checked_at TIMESTAMPTZ);
@@ -39,6 +39,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS playlist_item (playlist_id BIGINT NOT NULL REFERENCES playlist(id) ON DELETE CASCADE, position INTEGER NOT NULL, track_id BIGINT REFERENCES track(id) ON DELETE SET NULL, item_type TEXT NOT NULL, added_at TEXT, PRIMARY KEY(playlist_id,position));
         CREATE TABLE IF NOT EXISTS assessment (playlist_id BIGINT PRIMARY KEY REFERENCES playlist(id) ON DELETE CASCADE, score REAL, confidence REAL NOT NULL, summary TEXT NOT NULL, factors_json TEXT NOT NULL, genre_json TEXT NOT NULL DEFAULT '[]', created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS playlist_pair (playlist_a_id BIGINT NOT NULL REFERENCES playlist(id) ON DELETE CASCADE, playlist_b_id BIGINT NOT NULL REFERENCES playlist(id) ON DELETE CASCADE, shared_tracks INTEGER NOT NULL, jaccard REAL NOT NULL, containment REAL NOT NULL, artist_similarity REAL, year_similarity REAL, classification TEXT NOT NULL, PRIMARY KEY(playlist_a_id,playlist_b_id));
+        ALTER TABLE sync_run ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
         """)
 
 
