@@ -40,6 +40,15 @@ def status(job_id, status, stage, message="", **counts):
         db.commit()
 
 
+def advance_sync_progress(job_id: str, *, items: int = 0, readable: int = 0, skipped: int = 0) -> None:
+    """Atomically record visible progress while parallel playlist imports run."""
+    with connect() as db:
+        db.execute(
+            "UPDATE sync_run SET imported_items=imported_items + ?, readable_playlists=readable_playlists + ?, skipped_playlists=skipped_playlists + ? WHERE id=?",
+            (items, readable, skipped, job_id),
+        )
+
+
 def upsert_track(db, item):
     track = item.get("track") or item.get("item")
     if not track or track.get("type") != "track" or track.get("is_local"):
@@ -121,10 +130,15 @@ async def import_playlist_batch(job_id: str, spotify_ids: list[str]) -> list[dic
                         for item in payload.get("items", []):
                             track_id, item_type = upsert_track(db, item)
                             db.execute("INSERT INTO playlist_item(playlist_id,position,track_id,item_type,added_at) VALUES(?,?,?,?,?)", (row["id"], position, track_id, item_type, item.get("added_at"))); position += 1; items += 1
+                    # Update after every Spotify page so a large playlist does
+                    # not look frozen while its tracks are being saved.
+                    advance_sync_progress(job_id, items=len(payload.get("items", [])))
                     url, params = payload.get("next"), None
+            advance_sync_progress(job_id, readable=1)
             return {"readable": 1, "skipped": 0, "items": items}
         except httpx.HTTPError as error:
             with connect() as db: db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", (str(error)[:200], row["id"]))
+            advance_sync_progress(job_id, skipped=1)
             return {"readable": 0, "skipped": 1, "items": items}
 
     results = await asyncio.gather(*(import_one(spotify_id) for spotify_id in spotify_ids))
