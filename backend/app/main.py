@@ -230,6 +230,10 @@ def disconnect():
 async def sync():
     with connect() as db:
         if not db.execute("SELECT 1 FROM oauth_token WHERE id=1").fetchone(): raise HTTPException(400, "Connect Spotify first")
+        # A queued job that never reaches its worker would otherwise block every
+        # later sync forever. Only queued jobs expire here; active imports remain
+        # protected from a second simultaneous sync.
+        db.execute("UPDATE sync_run SET status='failed', stage='failed', message='Sync did not start within five minutes. Please retry.', completed_at=CURRENT_TIMESTAMP WHERE status='running' AND stage='queued' AND started_at < CURRENT_TIMESTAMP - INTERVAL '5 minutes'")
         existing = db.execute("SELECT id FROM sync_run WHERE status='running'").fetchone()
         if existing: return {"job_id": existing["id"]}
         job_id = str(uuid.uuid4()); db.execute("INSERT INTO sync_run(id,status,stage,message) VALUES(?,?,?,?)", (job_id, "running", "queued", "Sync queued")); db.commit()
