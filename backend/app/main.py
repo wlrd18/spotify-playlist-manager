@@ -1,0 +1,230 @@
+import asyncio
+import json
+import os
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from .analysis import analyze, detect_outliers, normalize
+from .db import connect, init_db, row_dict
+from .spotify import API, access_token, authorization_url, exchange_code, spotify_get
+
+load_dotenv()
+ROOT = Path(__file__).resolve().parents[2]
+FRONTEND = ROOT / "frontend"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Playlist intelligence", lifespan=lifespan)
+app.mount("/assets", StaticFiles(directory=FRONTEND), name="assets")
+
+
+def status(job_id, status, stage, message="", **counts):
+    with connect() as db:
+        db.execute("UPDATE sync_run SET status=?, stage=?, message=?, listed_playlists=COALESCE(?,listed_playlists), readable_playlists=COALESCE(?,readable_playlists), imported_items=COALESCE(?,imported_items), skipped_playlists=COALESCE(?,skipped_playlists), completed_at=CASE WHEN ? IN ('completed','completed_with_warnings','failed') THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?", (status, stage, message, counts.get("listed"), counts.get("readable"), counts.get("items"), counts.get("skipped"), status, job_id))
+        db.commit()
+
+
+def upsert_track(db, item):
+    track = item.get("track") or item.get("item")
+    if not track or track.get("type") != "track" or track.get("is_local"):
+        return None, (track or {}).get("type", "unknown")
+    spotify_id = track.get("id")
+    if not spotify_id:
+        return None, "unknown"
+    album = track.get("album") or {}
+    date = album.get("release_date")
+    try: year = int((date or "")[:4])
+    except ValueError: year = None
+    db.execute("INSERT INTO track(spotify_id,isrc,name,normalized_name,duration_ms,album_name,release_date,release_year,linked_from_id,is_local) VALUES(?,?,?,?,?,?,?,?,?,0) ON CONFLICT(spotify_id) DO UPDATE SET name=excluded.name, normalized_name=excluded.normalized_name, duration_ms=excluded.duration_ms, album_name=excluded.album_name, release_date=excluded.release_date, release_year=excluded.release_year", (spotify_id, (track.get("external_ids") or {}).get("isrc"), track.get("name", "Unknown track"), normalize(track.get("name")), track.get("duration_ms"), album.get("name"), date, year, (track.get("linked_from") or {}).get("id")))
+    track_id = db.execute("SELECT id FROM track WHERE spotify_id=?", (spotify_id,)).fetchone()["id"]
+    db.execute("DELETE FROM track_artist WHERE track_id=?", (track_id,))
+    for order, artist in enumerate(track.get("artists") or []):
+        db.execute("INSERT INTO artist(spotify_id,name,normalized_name) VALUES(?,?,?) ON CONFLICT(spotify_id) DO UPDATE SET name=excluded.name", (artist.get("id"), artist.get("name", "Unknown artist"), normalize(artist.get("name"))))
+        artist_id = db.execute("SELECT id FROM artist WHERE spotify_id=?", (artist.get("id"),)).fetchone()["id"]
+        db.execute("INSERT INTO track_artist(track_id,artist_id,ordinal) VALUES(?,?,?) ON CONFLICT DO NOTHING", (track_id, artist_id, order))
+    return track_id, "track"
+
+
+async def refresh_artist_genres(client: httpx.AsyncClient, token: str) -> None:
+    with connect() as db:
+        artists = db.execute("SELECT id,spotify_id FROM artist WHERE spotify_id IS NOT NULL AND (genres_checked_at IS NULL OR genres_checked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')").fetchall()
+    for start in range(0, len(artists), 50):
+        batch = artists[start:start + 50]
+        response = await spotify_get(client, f"{API}/artists", token, {"ids": ",".join(row["spotify_id"] for row in batch)})
+        response.raise_for_status()
+        by_spotify_id = {artist.get("id"): artist for artist in response.json().get("artists", []) if artist}
+        with connect() as db:
+            for row in batch:
+                artist = by_spotify_id.get(row["spotify_id"], {})
+                db.execute("DELETE FROM artist_genre WHERE artist_id=?", (row["id"],))
+                for genre in artist.get("genres", []):
+                    value = genre.strip().lower()[:100]
+                    if value:
+                        db.execute("INSERT INTO artist_genre(artist_id,genre) VALUES(?,?) ON CONFLICT DO NOTHING", (row["id"], value))
+                db.execute("UPDATE artist SET genres_checked_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+            db.commit()
+
+
+async def run_sync(job_id: str):
+    try:
+        token = await access_token()
+        with connect() as db:
+            account = db.execute("SELECT spotify_user_id FROM oauth_token WHERE id=1").fetchone()
+        owner_id = account["spotify_user_id"]
+        status(job_id, "running", "listing playlists")
+        async with httpx.AsyncClient(timeout=25) as client:
+            playlists, url, params = [], f"{API}/me/playlists", {"limit": 50}
+            while url:
+                response = await spotify_get(client, url, token, params)
+                response.raise_for_status(); payload = response.json(); playlists.extend(payload.get("items", [])); url = payload.get("next"); params = None
+            playlists = [playlist for playlist in playlists if (playlist.get("owner") or {}).get("id") == owner_id]
+            status(job_id, "running", "importing items", listed=len(playlists))
+            readable = skipped = item_count = 0
+            with connect() as db:
+                db.execute("DELETE FROM playlist WHERE owner_id IS NOT NULL AND owner_id != ?", (owner_id,))
+                for playlist in playlists:
+                    db.execute("INSERT INTO playlist(spotify_id,name,owner_id,snapshot_id,track_total,readable,error_reason,spotify_url) VALUES(?,?,?,?,?,1,NULL,?) ON CONFLICT(spotify_id) DO UPDATE SET name=excluded.name, owner_id=excluded.owner_id, snapshot_id=excluded.snapshot_id, track_total=excluded.track_total, readable=1, error_reason=NULL, spotify_url=excluded.spotify_url, updated_at=CURRENT_TIMESTAMP", (playlist["id"], playlist.get("name", "Untitled"), (playlist.get("owner") or {}).get("id"), playlist.get("snapshot_id"), (playlist.get("items") or playlist.get("tracks") or {}).get("total", 0), (playlist.get("external_urls") or {}).get("spotify")))
+                db.commit()
+            for playlist in playlists:
+                with connect() as db:
+                    row = db.execute("SELECT id,snapshot_id FROM playlist WHERE spotify_id=?", (playlist["id"],)).fetchone()
+                    db.execute("DELETE FROM playlist_item WHERE playlist_id=?", (row["id"],)); db.commit()
+                url, params, position = f"{API}/playlists/{playlist['id']}/items", {"limit": 50}, 0
+                try:
+                    while url:
+                        response = await spotify_get(client, url, token, params)
+                        if response.status_code == 403:
+                            with connect() as db:
+                                db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", ("Spotify denied access to this playlist's items", row["id"])); db.commit()
+                            skipped += 1; break
+                        response.raise_for_status(); payload = response.json()
+                        with connect() as db:
+                            for item in payload.get("items", []):
+                                track_id, item_type = upsert_track(db, item)
+                                db.execute("INSERT INTO playlist_item(playlist_id,position,track_id,item_type,added_at) VALUES(?,?,?,?,?)", (row["id"], position, track_id, item_type, item.get("added_at"))); position += 1; item_count += 1
+                            db.commit()
+                        url, params = payload.get("next"), None
+                    else: readable += 1
+                except httpx.HTTPError as error:
+                    skipped += 1
+                    with connect() as db:
+                        db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", (str(error)[:200], row["id"])); db.commit()
+                status(job_id, "running", "importing items", readable=readable, skipped=skipped, items=item_count)
+            # Genre enrichment is paused. It adds hundreds of Spotify requests on a new
+            # database and is not needed for playlist, song, or exact-overlap analysis.
+            # Re-enable refresh_artist_genres() when genre features become a priority.
+        status(job_id, "running", "analyzing", readable=readable, skipped=skipped, items=item_count)
+        with connect() as db: analyze(db, owner_id, int(os.getenv("MIN_TRACKS_FOR_SCORE", "8")))
+        final = "completed_with_warnings" if skipped else "completed"
+        status(job_id, final, "complete", "Analysis is ready", readable=readable, skipped=skipped, items=item_count)
+    except Exception as error:
+        status(job_id, "failed", "failed", str(error)[:300])
+
+
+@app.get("/")
+def home(): return FileResponse(FRONTEND / "index.html")
+
+@app.get("/api/health")
+def health():
+    with connect() as db: connected = bool(db.execute("SELECT 1 FROM oauth_token WHERE id=1").fetchone())
+    return {"ok": True, "spotify_connected": connected}
+
+@app.get("/api/auth/spotify/start")
+def start_auth():
+    try: return RedirectResponse(authorization_url())
+    except RuntimeError as error: raise HTTPException(400, str(error))
+
+@app.get("/api/auth/spotify/callback")
+async def auth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+    if error: return RedirectResponse(f"/?auth_error={error}")
+    try: await exchange_code(code or "", state or "")
+    except Exception as exc: return RedirectResponse(f"/?auth_error={str(exc)[:100]}")
+    return RedirectResponse("/?connected=1")
+
+@app.post("/api/auth/disconnect")
+def disconnect():
+    with connect() as db: db.execute("DELETE FROM oauth_token"); db.commit()
+    return {"ok": True}
+
+@app.post("/api/sync")
+async def sync():
+    with connect() as db:
+        if not db.execute("SELECT 1 FROM oauth_token WHERE id=1").fetchone(): raise HTTPException(400, "Connect Spotify first")
+        existing = db.execute("SELECT id FROM sync_run WHERE status='running'").fetchone()
+        if existing: return {"job_id": existing["id"]}
+        job_id = str(uuid.uuid4()); db.execute("INSERT INTO sync_run(id,status,stage,message) VALUES(?,?,?,?)", (job_id, "running", "queued", "Sync queued")); db.commit()
+    asyncio.create_task(run_sync(job_id)); return {"job_id": job_id}
+
+@app.get("/api/sync/{job_id}")
+def sync_status(job_id: str):
+    with connect() as db: row = db.execute("SELECT * FROM sync_run WHERE id=?", (job_id,)).fetchone()
+    if not row: raise HTTPException(404, "Sync job not found")
+    return row_dict(row)
+
+@app.get("/api/dashboard")
+def dashboard():
+    with connect() as db:
+        account = db.execute("SELECT spotify_user_id FROM oauth_token WHERE id=1").fetchone()
+        owner_id = account["spotify_user_id"] if account else ""
+        totals = db.execute("SELECT COUNT(*) playlists, COALESCE(SUM(readable),0) readable, COALESCE(SUM(track_total),0) items FROM playlist WHERE owner_id=?", (owner_id,)).fetchone()
+        pairs = db.execute("SELECT p1.name a,p2.name b,pp.* FROM playlist_pair pp JOIN playlist p1 ON p1.id=pp.playlist_a_id JOIN playlist p2 ON p2.id=pp.playlist_b_id WHERE pp.jaccard > 0 ORDER BY pp.jaccard DESC LIMIT 8").fetchall()
+        playlist_rows = db.execute("SELECT p.id,p.name,a.genre_json FROM assessment a JOIN playlist p ON p.id=a.playlist_id WHERE p.owner_id=? ORDER BY LOWER(p.name)", (owner_id,)).fetchall()
+    playlists = [row_dict(x) for x in playlist_rows]
+    for playlist in playlists:
+        playlist["genres"] = json.loads(playlist.pop("genre_json") or "[]")
+    return {"totals": row_dict(totals), "pairs": [row_dict(x) for x in pairs], "playlists": playlists}
+
+@app.get("/api/playlists")
+def playlists():
+    with connect() as db:
+        account = db.execute("SELECT spotify_user_id FROM oauth_token WHERE id=1").fetchone()
+        rows = db.execute("SELECT p.id,p.name,p.track_total,p.readable,p.error_reason,p.spotify_url,a.summary,a.genre_json FROM playlist p LEFT JOIN assessment a ON a.playlist_id=p.id WHERE p.owner_id=? ORDER BY LOWER(p.name)", (account["spotify_user_id"] if account else "",)).fetchall()
+    playlists = [row_dict(row) for row in rows]
+    for playlist in playlists:
+        playlist["genres"] = json.loads(playlist.pop("genre_json") or "[]")
+    return playlists
+
+@app.get("/api/playlists/{playlist_id}")
+def playlist_detail(playlist_id: int):
+    with connect() as db:
+        account = db.execute("SELECT spotify_user_id FROM oauth_token WHERE id=1").fetchone()
+        owner_id = account["spotify_user_id"] if account else ""
+        playlist = db.execute("SELECT p.* FROM playlist p WHERE p.id=? AND p.owner_id=?", (playlist_id, owner_id)).fetchone()
+        if not playlist: raise HTTPException(404, "Playlist not found")
+        comparisons = db.execute("SELECT p.id,p.name,pp.* FROM playlist_pair pp JOIN playlist p ON p.id=CASE WHEN pp.playlist_a_id=? THEN pp.playlist_b_id ELSE pp.playlist_a_id END WHERE (pp.playlist_a_id=? OR pp.playlist_b_id=?) AND pp.jaccard > 0 ORDER BY pp.jaccard DESC", (playlist_id, playlist_id, playlist_id)).fetchall()
+        tracks = db.execute("""SELECT pi.position,t.name
+            FROM playlist_item pi LEFT JOIN track t ON t.id=pi.track_id
+            WHERE pi.playlist_id=? ORDER BY pi.position""", (playlist_id,)).fetchall()
+    data = row_dict(playlist)
+    data["comparisons"] = [row_dict(row) for row in comparisons]
+    data["tracks"] = [row_dict(row) for row in tracks]
+    return data
+
+@app.get("/api/comparisons/{playlist_a_id}/{playlist_b_id}")
+def comparison_detail(playlist_a_id: int, playlist_b_id: int):
+    with connect() as db:
+        account = db.execute("SELECT spotify_user_id FROM oauth_token WHERE id=1").fetchone()
+        owner_id = account["spotify_user_id"] if account else ""
+        pair = db.execute("SELECT pp.*,p1.name a_name,p2.name b_name FROM playlist_pair pp JOIN playlist p1 ON p1.id=pp.playlist_a_id JOIN playlist p2 ON p2.id=pp.playlist_b_id WHERE ((pp.playlist_a_id=? AND pp.playlist_b_id=?) OR (pp.playlist_a_id=? AND pp.playlist_b_id=?)) AND p1.owner_id=? AND p2.owner_id=?", (playlist_a_id, playlist_b_id, playlist_b_id, playlist_a_id, owner_id, owner_id)).fetchone()
+        if not pair or pair["jaccard"] == 0: raise HTTPException(404, "These playlists do not share tracks")
+        tracks = db.execute("SELECT t.name,a.name artist,STRING_AGG(DISTINCT CASE WHEN pi.playlist_id=? THEN pi.position::TEXT END, ',') a_positions,STRING_AGG(DISTINCT CASE WHEN pi.playlist_id=? THEN pi.position::TEXT END, ',') b_positions FROM playlist_item pi JOIN track t ON t.id=pi.track_id LEFT JOIN track_artist ta ON ta.track_id=t.id AND ta.ordinal=0 LEFT JOIN artist a ON a.id=ta.artist_id WHERE pi.playlist_id IN (?,?) GROUP BY t.id,a.name HAVING COUNT(DISTINCT pi.playlist_id)=2 ORDER BY t.name", (playlist_a_id, playlist_b_id, playlist_a_id, playlist_b_id)).fetchall()
+    return {"pair": row_dict(pair), "tracks": [row_dict(row) for row in tracks]}
+
+@app.delete("/api/local-data")
+def delete_data():
+    with connect() as db:
+        for table in ("playlist_pair", "assessment", "playlist_item", "track_artist", "artist", "track", "playlist", "sync_run", "oauth_token", "oauth_pending"): db.execute(f"DELETE FROM {table}")
+        db.commit()
+    return {"ok": True}

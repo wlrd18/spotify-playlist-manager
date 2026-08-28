@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Follow One Click</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+  <main>
+    <p><a href="../MISSION.md">Mission</a> · Lesson 1</p>
+    <h1>Follow one click</h1>
+    <p class="lede">A web app is a conversation between the page, the server, and the database. Learn that path and Codex's changes become much easier to read.</p>
+
+    <h2>The dashboard load</h2>
+    <div class="card flow"><span>Browser</span><i>→</i><span><code>/api/dashboard</code></span><i>→</i><span>FastAPI</span><i>→</i><span>SQLite</span><i>→</i><span>JSON back to browser</span></div>
+    <p>When the page opens, JavaScript in <code>frontend/index.html</code> calls <code>fetch('/api/dashboard')</code>. The route in <code>backend/app/main.py</code> reads the local SQLite database, returns JSON, and the page turns that data into cards and tables.</p>
+
+    <h2>Why this helps when Codex changes something</h2>
+    <div class="card">
+      <ul>
+        <li>A visual issue usually starts in <code>frontend/index.html</code>.</li>
+        <li>A wrong number or missing playlist often starts in an API route or analysis code.</li>
+        <li>Missing or stale data usually points to the Spotify sync or SQLite database.</li>
+      </ul>
+    </div>
+
+    <h2>Quick check</h2>
+    <div class="card">
+      <p>Which file first asks the server for dashboard data?</p>
+      <button id="reveal">Show answer</button>
+      <p id="answer" hidden><code>frontend/index.html</code>. It runs in the browser and sends the request with <code>fetch</code>.</p>
+    </div>
+
+    <h2>Try it now</h2>
+    <p>Open <code>frontend/index.html</code> and find <code>fetch('/api/dashboard')</code>. Then open <code>backend/app/main.py</code> and find <code>def dashboard()</code>. You have just followed a full browser-to-database request.</p>
+
+    <p>Primary reading: <a href="https://developer.mozilla.org/en-US/docs/Learn_web_development">MDN Learn web development</a>. Ask me to explain any line you find while tracing the request.</p>
+  </main>
+  <script>document.querySelector('#reveal').onclick=()=>document.querySelector('#answer').hidden=false;</script>
+</body>
+</html>

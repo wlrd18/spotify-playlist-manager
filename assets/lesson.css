@@ -1,0 +1,15 @@
+:root { color-scheme: light; font-family: Inter, system-ui, sans-serif; color: #17211d; background: #f5f6f2; }
+body { margin: 0; line-height: 1.55; }
+main { max-width: 760px; margin: 40px auto; padding: 0 24px 56px; }
+h1 { font-size: 2.2rem; line-height: 1.1; margin-bottom: 8px; }
+h2 { margin-top: 32px; }
+.lede { font-size: 1.15rem; color: #4b5750; }
+.card { background: white; border: 1px solid #dce2db; border-radius: 12px; padding: 20px; margin: 16px 0; }
+.flow { display: grid; grid-template-columns: repeat(5, auto); gap: 8px; align-items: center; font-weight: 650; }
+.flow span { text-align: center; padding: 9px; border-radius: 8px; background: #e8f1e9; }
+.flow i { font-style: normal; color: #52715a; }
+button { background: #173d26; color: white; border: 0; border-radius: 7px; padding: 9px 12px; cursor: pointer; }
+#answer { margin-top: 12px; font-weight: 650; }
+code { background: #edf0ec; padding: 2px 5px; border-radius: 4px; }
+a { color: #145f36; }
+@media (max-width: 600px) { .flow { grid-template-columns: 1fr; } .flow i { transform: rotate(90deg); } }
