@@ -15,6 +15,10 @@ class Database:
         else: self.connection.commit()
         self.connection.close()
     def execute(self, sql, params=None): return self.connection.execute(sql.replace("?", "%s"), params)
+    def executemany(self, sql, params_seq):
+        """Run a bounded batch with the same parameterized SQL conversion."""
+        with self.connection.cursor() as cursor:
+            return cursor.executemany(sql.replace("?", "%s"), params_seq)
     def commit(self): self.connection.commit()
 
 

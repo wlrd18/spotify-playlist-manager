@@ -38,7 +38,7 @@ async def sync_spotify_playlists(ctx: inngest.Context) -> dict[str, str]:
         raise ValueError("Invalid sync job")
 
     # Import here to avoid a circular import while FastAPI registers this function.
-    from .main import finalize_sync, import_playlist_page, prepare_sync
+    from .main import analyze_similarity_step, finalize_sync, import_playlist_page, prepare_similarity, prepare_sync
 
     prepared = await ctx.step.run("prepare-sync", partial(prepare_sync, job_id))
     results = []
@@ -57,5 +57,17 @@ async def sync_spotify_playlists(ctx: inngest.Context) -> dict[str, str]:
                 break
             offset = page["next_offset"]
             page_number += 1
-    await ctx.step.run("analyze-playlists", partial(finalize_sync, job_id, prepared["owner_id"], results))
+    analysis = await ctx.step.run(
+        "prepare-similarities", partial(prepare_similarity, job_id, prepared["owner_id"], results)
+    )
+    playlist_ids = analysis["playlist_ids"]
+    # Each durable step compares four playlists against the remaining collection.
+    # It can resume safely after a Vercel timeout instead of repeating the whole sync.
+    for start in range(0, max(len(playlist_ids) - 1, 0), 4):
+        end = min(start + 4, len(playlist_ids) - 1)
+        await ctx.step.run(
+            f"similarities-{start + 1}-{end}",
+            partial(analyze_similarity_step, job_id, playlist_ids, start, end, analysis),
+        )
+    await ctx.step.run("complete-sync", partial(finalize_sync, job_id, analysis))
     return {"job_id": job_id, "status": "completed"}

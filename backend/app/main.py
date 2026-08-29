@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from .analysis import analyze, detect_outliers, normalize
+from .analysis import analyze_similarity_chunk, normalize, prepare_similarity_analysis
 from .db import connect, init_db, row_dict
 from .inngest_jobs import configured as inngest_configured
 from .inngest_jobs import inngest_client, queue_sync, sync_spotify_playlists
@@ -68,26 +68,6 @@ def upsert_track(db, item):
         artist_id = db.execute("SELECT id FROM artist WHERE spotify_id=?", (artist.get("id"),)).fetchone()["id"]
         db.execute("INSERT INTO track_artist(track_id,artist_id,ordinal) VALUES(?,?,?) ON CONFLICT DO NOTHING", (track_id, artist_id, order))
     return track_id, "track"
-
-
-async def refresh_artist_genres(client: httpx.AsyncClient, token: str) -> None:
-    with connect() as db:
-        artists = db.execute("SELECT id,spotify_id FROM artist WHERE spotify_id IS NOT NULL AND (genres_checked_at IS NULL OR genres_checked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')").fetchall()
-    for start in range(0, len(artists), 50):
-        batch = artists[start:start + 50]
-        response = await spotify_get(client, f"{API}/artists", token, {"ids": ",".join(row["spotify_id"] for row in batch)})
-        response.raise_for_status()
-        by_spotify_id = {artist.get("id"): artist for artist in response.json().get("artists", []) if artist}
-        with connect() as db:
-            for row in batch:
-                artist = by_spotify_id.get(row["spotify_id"], {})
-                db.execute("DELETE FROM artist_genre WHERE artist_id=?", (row["id"],))
-                for genre in artist.get("genres", []):
-                    value = genre.strip().lower()[:100]
-                    if value:
-                        db.execute("INSERT INTO artist_genre(artist_id,genre) VALUES(?,?) ON CONFLICT DO NOTHING", (row["id"], value))
-                db.execute("UPDATE artist SET genres_checked_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
-            db.commit()
 
 
 async def prepare_sync(job_id: str) -> dict:
@@ -149,69 +129,59 @@ async def import_playlist_page(job_id: str, spotify_id: str, offset: int) -> dic
     return {"done": done, "next_offset": next_offset, "readable": int(done), "skipped": 0, "items": inserted}
 
 
-async def finalize_sync(job_id: str, owner_id: str, results: list[dict]) -> dict:
+def _sync_counts(results: list[dict]) -> dict[str, int]:
     readable = sum(result["readable"] for result in results)
     skipped = sum(result["skipped"] for result in results)
     items = sum(result["items"] for result in results)
-    status(job_id, "running", "analyzing", readable=readable, skipped=skipped, items=items)
-    with connect() as db: analyze(db, owner_id, int(os.getenv("MIN_TRACKS_FOR_SCORE", "8")))
+    return {"readable": readable, "skipped": skipped, "items": items}
+
+
+async def prepare_similarity(job_id: str, owner_id: str, results: list[dict]) -> dict:
+    counts = _sync_counts(results)
+    status(job_id, "running", "preparing similarities", "Preparing playlist comparisons", **counts)
+    with connect() as db:
+        playlist_ids = prepare_similarity_analysis(db, owner_id)
+    return {"playlist_ids": playlist_ids, **counts}
+
+
+async def analyze_similarity_step(job_id: str, playlist_ids: list[int], start: int, end: int, counts: dict) -> dict:
+    with connect() as db:
+        stored_pairs = analyze_similarity_chunk(db, playlist_ids, start, end)
+    status(
+        job_id,
+        "running",
+        "analyzing similarities",
+        f"Compared {end} of {len(playlist_ids)} playlists",
+        **counts,
+    )
+    return {"stored_pairs": stored_pairs}
+
+
+async def finalize_sync(job_id: str, counts: dict) -> dict:
+    skipped = counts["skipped"]
     final = "completed_with_warnings" if skipped else "completed"
-    status(job_id, final, "complete", "Analysis is ready", readable=readable, skipped=skipped, items=items)
+    status(job_id, final, "complete", "Analysis is ready", **counts)
     return {"status": final}
 
 
 async def run_sync(job_id: str, raise_on_error: bool = False):
     try:
-        token = await access_token()
-        with connect() as db:
-            account = db.execute("SELECT spotify_user_id FROM oauth_token WHERE id=1").fetchone()
-        owner_id = account["spotify_user_id"]
-        status(job_id, "running", "listing playlists")
-        async with httpx.AsyncClient(timeout=25) as client:
-            playlists, url, params = [], f"{API}/me/playlists", {"limit": 50}
-            while url:
-                response = await spotify_get(client, url, token, params)
-                response.raise_for_status(); payload = response.json(); playlists.extend(payload.get("items", [])); url = payload.get("next"); params = None
-            playlists = [playlist for playlist in playlists if (playlist.get("owner") or {}).get("id") == owner_id]
-            status(job_id, "running", "importing items", listed=len(playlists))
-            readable = skipped = item_count = 0
-            with connect() as db:
-                db.execute("DELETE FROM playlist WHERE owner_id IS NOT NULL AND owner_id != ?", (owner_id,))
-                for playlist in playlists:
-                    db.execute("INSERT INTO playlist(spotify_id,name,owner_id,snapshot_id,track_total,readable,error_reason,spotify_url) VALUES(?,?,?,?,?,1,NULL,?) ON CONFLICT(spotify_id) DO UPDATE SET name=excluded.name, owner_id=excluded.owner_id, snapshot_id=excluded.snapshot_id, track_total=excluded.track_total, readable=1, error_reason=NULL, spotify_url=excluded.spotify_url, updated_at=CURRENT_TIMESTAMP", (playlist["id"], playlist.get("name", "Untitled"), (playlist.get("owner") or {}).get("id"), playlist.get("snapshot_id"), (playlist.get("items") or playlist.get("tracks") or {}).get("total", 0), (playlist.get("external_urls") or {}).get("spotify")))
-                db.commit()
-            for playlist in playlists:
-                with connect() as db:
-                    row = db.execute("SELECT id,snapshot_id FROM playlist WHERE spotify_id=?", (playlist["id"],)).fetchone()
-                    db.execute("DELETE FROM playlist_item WHERE playlist_id=?", (row["id"],)); db.commit()
-                url, params, position = f"{API}/playlists/{playlist['id']}/items", {"limit": 50}, 0
-                try:
-                    while url:
-                        response = await spotify_get(client, url, token, params)
-                        if response.status_code == 403:
-                            with connect() as db:
-                                db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", ("Spotify denied access to this playlist's items", row["id"])); db.commit()
-                            skipped += 1; break
-                        response.raise_for_status(); payload = response.json()
-                        with connect() as db:
-                            for item in payload.get("items", []):
-                                track_id, item_type = upsert_track(db, item)
-                                db.execute("INSERT INTO playlist_item(playlist_id,position,track_id,item_type,added_at) VALUES(?,?,?,?,?)", (row["id"], position, track_id, item_type, item.get("added_at"))); position += 1; item_count += 1
-                            db.commit()
-                        url, params = payload.get("next"), None
-                    else: readable += 1
-                except httpx.HTTPError as error:
-                    skipped += 1
-                    with connect() as db:
-                        db.execute("UPDATE playlist SET readable=0,error_reason=? WHERE id=?", (str(error)[:200], row["id"])); db.commit()
-                status(job_id, "running", "importing items", readable=readable, skipped=skipped, items=item_count)
-            # Genre enrichment is paused. It adds hundreds of Spotify requests on a new
-            # database and is not needed for playlist, song, or exact-overlap analysis.
-            # Re-enable refresh_artist_genres() when genre features become a priority.
-        status(job_id, "running", "analyzing", readable=readable, skipped=skipped, items=item_count)
-        with connect() as db: analyze(db, owner_id, int(os.getenv("MIN_TRACKS_FOR_SCORE", "8")))
-        final = "completed_with_warnings" if skipped else "completed"
-        status(job_id, final, "complete", "Analysis is ready", readable=readable, skipped=skipped, items=item_count)
+        prepared = await prepare_sync(job_id)
+        results = []
+        for spotify_id in prepared["playlist_ids"]:
+            offset = imported = 0
+            while True:
+                page = await import_playlist_page(job_id, spotify_id, offset)
+                imported += page["items"]
+                if page["done"]:
+                    results.append({"readable": page["readable"], "skipped": page["skipped"], "items": imported})
+                    break
+                offset = page["next_offset"]
+        analysis = await prepare_similarity(job_id, prepared["owner_id"], results)
+        playlist_ids = analysis["playlist_ids"]
+        for start in range(0, max(len(playlist_ids) - 1, 0), 4):
+            await analyze_similarity_step(job_id, playlist_ids, start, min(start + 4, len(playlist_ids) - 1), analysis)
+        await finalize_sync(job_id, analysis)
     except Exception as error:
         status(job_id, "failed", "failed", str(error)[:300])
         if raise_on_error:
